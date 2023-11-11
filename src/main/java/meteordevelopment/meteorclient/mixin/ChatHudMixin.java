@@ -116,12 +116,20 @@ public abstract class ChatHudMixin implements IChatHud {
         }
     }
 
-    //modify max lengths for messages and visible messages
-    @ModifyConstant(method = "addMessage(Lnet/minecraft/text/Text;Lnet/minecraft/network/message/MessageSignatureData;ILnet/minecraft/client/gui/hud/MessageIndicator;Z)V", constant = @Constant(intValue = 100))
-    private int maxLength(int size) {
-        if (Modules.get() == null || !getBetterChat().isLongerChat()) return size;
+    @ModifyExpressionValue(method = "addMessage(Lnet/minecraft/text/Text;Lnet/minecraft/network/message/MessageSignatureData;ILnet/minecraft/client/gui/hud/MessageIndicator;Z)V",
+        slice = @Slice(from = @At(value = "FIELD", target = "Lnet/minecraft/client/gui/hud/ChatHud;visibleMessages:Ljava/util/List;")), at = @At(value = "INVOKE", target = "Ljava/util/List;size()I"))
+    private int addMessageListSizeProxy(int size) {
+        if (Modules.get() == null || !betterChat.isLongerChat()) return size;
 
-        return size + betterChat.getExtraChatLines();
+        return size - betterChat.getExtraChatLines();
+    }
+
+    @ModifyArg(method = "addMessage(Lnet/minecraft/text/Text;Lnet/minecraft/network/message/MessageSignatureData;ILnet/minecraft/client/gui/hud/MessageIndicator;Z)V",
+        at = @At(value = "INVOKE", target = "Ljava/util/List;remove(I)Ljava/lang/Object;"), index = 0)
+    private int addMessageRemoveIndexProxy(int index) {
+        if (Modules.get() == null || !betterChat.isLongerChat()) return index;
+
+        return index + betterChat.getExtraChatLines();
     }
 
     // Player Heads
