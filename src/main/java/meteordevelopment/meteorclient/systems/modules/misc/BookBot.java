@@ -42,6 +42,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.function.Predicate;
+import java.util.stream.IntStream;
 
 public class BookBot extends Module {
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
@@ -59,6 +60,36 @@ public class BookBot extends Module {
         .defaultValue(50)
         .range(1, 100)
         .sliderRange(1, 100)
+        .visible(() -> mode.get() != Mode.File)
+        .build()
+    );
+
+    private final Setting<Integer> bytes = sgGeneral.add(new IntSetting.Builder()
+        .name("bytes")
+        .description("The number of bytes to write per page.")
+        .defaultValue(1024)
+        .range(0, 1280)
+        .sliderRange(0, 1280)
+        .visible(() -> mode.get() != Mode.File)
+        .build()
+    );
+
+    private final Setting<Integer> maxCharWidth = sgGeneral.add(new IntSetting.Builder()
+        .name("max-char-width")
+        .description("Max width for multibyte chars")
+        .defaultValue(4)
+        .range(2, 8)
+        .sliderRange(2, 8)
+        .visible(() -> mode.get() != Mode.File)
+        .build()
+    );
+
+    private final Setting<Integer> lines = sgGeneral.add(new IntSetting.Builder()
+        .name("lines")
+        .description("The number of lines to write per page.")
+        .defaultValue(14)
+        .range(0, 14)
+        .sliderRange(0, 14)
         .visible(() -> mode.get() != Mode.File)
         .build()
     );
@@ -194,14 +225,15 @@ public class BookBot extends Module {
         // Write book
 
         if (mode.get() == Mode.Random) {
-            int origin = onlyAscii.get() ? 0x21 : 0x0800;
+            int origin = 0x21;
             int bound = onlyAscii.get() ? 0x7E : 0x10FFFF;
 
             writeBook(
                 // Generate a random load of ints to use as random characters
                 random.ints(origin, bound)
                     .filter(i -> !Character.isWhitespace(i) && i != '\r' && i != '\n')
-                    .iterator()
+                    .iterator(),
+                true
             );
         } else if (mode.get() == Mode.File) {
             // Ignore if somehow the file got deleted
@@ -238,14 +270,14 @@ public class BookBot extends Module {
                 reader.close();
 
                 // Write the file string to a book
-                writeBook(file.toString().chars().iterator());
+                writeBook(file.toString().chars().iterator(), false);
             } catch (IOException ignored) {
                 error("Failed to read the file.");
             }
         }
     }
 
-    private void writeBook(PrimitiveIterator.OfInt chars) {
+    private void writeBook(PrimitiveIterator.OfInt chars, boolean fillPages) {
         ArrayList<String> pages = new ArrayList<>();
         TextHandler.WidthRetriever widthRetriever = ((TextHandlerAccessor) mc.textRenderer.getTextHandler()).getWidthRetriever();
 
@@ -256,45 +288,67 @@ public class BookBot extends Module {
 
         final StringBuilder page = new StringBuilder();
 
+        int totalBytes = 0;
         float lineWidth = 0;
 
         while (chars.hasNext()) {
             int c = chars.nextInt();
 
+            float charWidth = widthRetriever.getWidth(c, Style.EMPTY);
+            if (charWidth > this.maxCharWidth.get()) continue;
+
+            int charBytes = new String(Character.toChars(c)).getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+
             if (c == '\r' || c == '\n') {
                 page.append('\n');
-                lineWidth = 0;
                 lineIndex++;
+                totalBytes += 1;
+                lineWidth = 0;
             } else {
-                float charWidth = widthRetriever.getWidth(c, Style.EMPTY);
-
-                // Reached end of line
-                if (lineWidth + charWidth > 114f) {
-                    page.append('\n');
-                    lineWidth = charWidth;
-                    lineIndex++;
-                    // Wrap to next line, unless wrapping to next page
-                    if (lineIndex != 14) page.appendCodePoint(c);
-                } else if (lineWidth == 0f && c == ' ') {
-                    continue; // Prevent leading space from text wrapping
+                if ((totalBytes + charBytes) > this.bytes.get()) {
+                    if (fillPages) {
+                        continue; // Try again for a smaller character
+                    }
+                    lineIndex = this.lines.get(); // Otherwise, signal that this page is done
                 } else {
-                    lineWidth += charWidth;
-                    page.appendCodePoint(c);
+                    if (lineWidth + charWidth > 114f) { // Reached end of line
+                        page.append('\n');
+                        lineIndex++;
+                        totalBytes += 1;
+                        lineWidth = 0;
+                        // Wrap to next line, unless wrapping to next page
+                        if (lineIndex != this.lines.get()) {
+                            totalBytes += charBytes;
+                            lineWidth += charWidth;
+                            page.appendCodePoint(c);
+                        }
+                    } else if (lineWidth == 0f && c == ' ') {
+                        continue; // Prevent leading space from text wrapping
+                    } else {
+                        totalBytes += charBytes;
+                        lineWidth += charWidth;
+                        page.appendCodePoint(c);
+                    }
                 }
             }
 
             // Reached end of page
-            if (lineIndex == 14) {
+            if (lineIndex == this.lines.get() || totalBytes >= this.bytes.get()) {
+                MeteorClient.LOG.warn("Wrote " + totalBytes + " bytes in page " + pageIndex);
                 pages.add(page.toString());
                 page.setLength(0);
                 pageIndex++;
                 lineIndex = 0;
+                totalBytes = 0;
+                lineWidth = 0;
 
                 // No more pages
                 if (pageIndex == maxPages) break;
 
                 // Wrap to next page
                 if (c != '\r' && c != '\n') {
+                    totalBytes += charBytes;
+                    lineWidth += charWidth;
                     page.appendCodePoint(c);
                 }
             }
@@ -302,6 +356,106 @@ public class BookBot extends Module {
 
         // No more characters, end current page
         if (!page.isEmpty() && pageIndex != maxPages) {
+            pages.add(page.toString());
+        }
+
+        // Get the title with count
+        String title = name.get();
+        if (count.get() && bookCount != 0) title += " #" + bookCount;
+
+        // Write data to book
+        mc.player.getMainHandStack().setSubNbt("title", NbtString.of(title));
+        mc.player.getMainHandStack().setSubNbt("author", NbtString.of(mc.player.getGameProfile().getName()));
+
+        // Write pages NBT
+        NbtList pageNbt = new NbtList();
+        pages.stream().map(NbtString::of).forEach(pageNbt::add);
+        if (!pages.isEmpty()) mc.player.getMainHandStack().setSubNbt("pages", pageNbt);
+
+        // Send book update to server
+        mc.player.networkHandler.sendPacket(new BookUpdateC2SPacket(mc.player.getInventory().selectedSlot, pages, sign.get() ? Optional.of(title) : Optional.empty()));
+
+        bookCount++;
+    }
+
+    private void writeRandomBook() {
+        PrimitiveIterator.OfInt threebytechars = random.ints(0x0800, 0x10000)
+            .filter(i -> !Character.isWhitespace(i))
+            .iterator();
+
+        PrimitiveIterator.OfInt onebytechars = random.ints(0x21, 0x7E)
+            .filter(i -> !Character.isWhitespace(i) && i != '\r' && i != '\n')
+            .iterator();
+
+        ArrayList<String> pages = new ArrayList<>();
+
+        for (int pageI = 0; pageI < (mode.get() == Mode.File ? 100 : this.pages.get()); pageI++) {
+            StringBuilder page = new StringBuilder();
+
+            int totalBytes = 0;
+            for (int lineI = 0; lineI < this.lines.get(); lineI++) {
+                if (totalBytes >= this.bytes.get()) break;
+
+                double lineWidth = 0;
+                StringBuilder line = new StringBuilder();
+
+                while (totalBytes + 3 <= this.bytes.get()) {
+                    // Get the next character
+                    int nextChar = threebytechars.nextInt();
+
+                    // Ignore newline chars when writing lines, should already be organised
+                    if (nextChar == '\r' || nextChar == '\n') break;
+
+                    // Make sure the character will fit on the line
+                    double charWidth = ((TextHandlerAccessor) mc.textRenderer.getTextHandler()).getWidthRetriever().getWidth(nextChar, Style.EMPTY);
+                    if (charWidth > this.maxCharWidth.get()) continue;
+                    if (lineWidth + charWidth > 114) break;
+
+                    int charBytes = new String(Character.toChars(nextChar)).getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+                    if ((totalBytes + charBytes) > this.bytes.get()) continue;
+
+                    // Append it to the line
+                    line.appendCodePoint(nextChar);
+                    lineWidth += charWidth;
+                    totalBytes += charBytes;
+                }
+
+                if (totalBytes + 3 > this.bytes.get()) {
+                    if (totalBytes < this.bytes.get()) {
+                        MeteorClient.LOG.warn("Page almost full! Wrote " + totalBytes + " bytes of 3-byte characters");
+                    } else {
+                        MeteorClient.LOG.warn("Page already full! Wrote " + totalBytes + " bytes of 3-byte characters");
+                    }
+                    while(totalBytes < this.bytes.get()) {
+                        if (lineWidth + 2 > 114) {
+                            MeteorClient.LOG.warn("Didn't write extra byte, line too long");
+                            break;
+                        }
+
+                        int nextChar = onebytechars.nextInt();
+
+                        double charWidth = ((TextHandlerAccessor) mc.textRenderer.getTextHandler()).getWidthRetriever().getWidth(nextChar, Style.EMPTY);
+                        if (lineWidth + charWidth > 114) continue;
+
+                        line.appendCodePoint(nextChar);
+                        lineWidth += charWidth;
+                        totalBytes += 1;
+                        MeteorClient.LOG.warn("Wrote extra byte, page is now " + totalBytes + " bytes");
+                    }
+                }
+
+                // Append the line to the page
+                page.append(line);
+                if (totalBytes < this.bytes.get()) {
+                    page.append('\n');
+                    totalBytes += 1;
+                    if (totalBytes == this.bytes.get()) {
+                        MeteorClient.LOG.warn("Wrote final newline, page is now " + totalBytes + " bytes");
+                    }
+                }
+            }
+
+            // Append page to the page list
             pages.add(page.toString());
         }
 
