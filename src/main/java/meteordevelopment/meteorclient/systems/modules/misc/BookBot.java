@@ -42,7 +42,6 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.function.Predicate;
-import java.util.stream.IntStream;
 
 public class BookBot extends Module {
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
@@ -64,9 +63,9 @@ public class BookBot extends Module {
         .build()
     );
 
-    private final Setting<Integer> bytes = sgGeneral.add(new IntSetting.Builder()
-        .name("bytes")
-        .description("The number of bytes to write per page.")
+    private final Setting<Integer> maxBytes = sgGeneral.add(new IntSetting.Builder()
+        .name("max-bytes")
+        .description("The maximum number of bytes to write per page.")
         .defaultValue(1024)
         .range(0, 1280)
         .sliderRange(0, 1280)
@@ -74,9 +73,19 @@ public class BookBot extends Module {
         .build()
     );
 
+    private final Setting<Integer> maxChars = sgGeneral.add(new IntSetting.Builder()
+        .name("max-chars")
+        .description("The maximum number of characters to write per page.")
+        .defaultValue(320)
+        .range(0, 512)
+        .sliderRange(0, 512)
+        .visible(() -> mode.get() != Mode.File)
+        .build()
+    );
+
     private final Setting<Integer> maxCharWidth = sgGeneral.add(new IntSetting.Builder()
         .name("max-char-width")
-        .description("Max width for multibyte chars")
+        .description("The maximum acceptable width (in pixels) of randomly selected characters.")
         .defaultValue(4)
         .range(2, 8)
         .sliderRange(2, 8)
@@ -98,6 +107,22 @@ public class BookBot extends Module {
         .name("ascii-only")
         .description("Only uses the characters in the ASCII charset.")
         .defaultValue(false)
+        .visible(() -> mode.get() == Mode.Random)
+        .build()
+    );
+
+    private final Setting<Boolean> excludeTwoByte = sgGeneral.add(new BoolSetting.Builder()
+        .name("exclude-two-byte")
+        .description("Excludes characters that are encoded as 2 bytes in UTF-8, i.e. U+0080 - U+07FF, unless needed to fill a page.")
+        .defaultValue(true)
+        .visible(() -> mode.get() == Mode.Random)
+        .build()
+    );
+
+    private final Setting<Boolean> excludeOneByte = sgGeneral.add(new BoolSetting.Builder()
+        .name("exclude-one-byte")
+        .description("Excludes characters that are encoded as 1 byte in UTF-8, i.e. U+0000 - U+07F / ASCII, unless needed to fill a page.")
+        .defaultValue(true)
         .visible(() -> mode.get() == Mode.Random)
         .build()
     );
@@ -126,10 +151,27 @@ public class BookBot extends Module {
         .build()
     );
 
+    private final Setting<String> author = sgGeneral.add(new StringSetting.Builder()
+        .name("author")
+        .description("The author you want to give your books (defaults to player name).")
+        .defaultValue("")
+        .visible(sign::get)
+        .build()
+    );
+
     private final Setting<Boolean> count = sgGeneral.add(new BoolSetting.Builder()
         .name("append-count")
         .description("Whether to append the number of the book to the title.")
         .defaultValue(true)
+        .visible(sign::get)
+        .build()
+    );
+
+    private final Setting<Integer> countStart = sgGeneral.add(new IntSetting.Builder()
+        .name("count-start")
+        .description("What number to give the first book.")
+        .defaultValue(1)
+        .noSlider()
         .visible(sign::get)
         .build()
     );
@@ -191,7 +233,12 @@ public class BookBot extends Module {
 
         random = new Random();
         delayTimer = delay.get();
-        bookCount = 0;
+        bookCount = this.countStart.get();
+    }
+
+    @Override
+    public void onDeactivate() {
+        this.countStart.set(bookCount);
     }
 
     @EventHandler
@@ -225,13 +272,25 @@ public class BookBot extends Module {
         // Write book
 
         if (mode.get() == Mode.Random) {
-            int origin = 0x21;
-            int bound = onlyAscii.get() ? 0x7E : 0x10FFFF;
+            int bound = onlyAscii.get() ? 0x7F : 0x10000;
 
             writeBook(
                 // Generate a random load of ints to use as random characters
-                random.ints(origin, bound)
-                    .filter(i -> !Character.isWhitespace(i) && i != '\r' && i != '\n')
+                random.ints(0, bound)
+                    .filter(i -> {
+                        byte charType = (byte)Character.getType(i);
+                        return charType != Character.UNASSIGNED &&
+                               charType != Character.NON_SPACING_MARK &&
+                               charType != Character.ENCLOSING_MARK &&
+                               charType != Character.COMBINING_SPACING_MARK &&
+                               charType != Character.SPACE_SEPARATOR &&
+                               charType != Character.LINE_SEPARATOR &&
+                               charType != Character.PARAGRAPH_SEPARATOR &&
+                               charType != Character.CONTROL &&
+                               charType != Character.FORMAT &&
+                               charType != Character.PRIVATE_USE &&
+                               charType != Character.SURROGATE;
+                    })
                     .iterator(),
                 true
             );
@@ -283,12 +342,17 @@ public class BookBot extends Module {
 
         int maxPages = mode.get() == Mode.File ? 100 : this.pages.get();
 
+
+        boolean excludeTwoByte = this.excludeTwoByte.get();
+        boolean excludeOneByte = this.excludeOneByte.get();
+
         int pageIndex = 0;
         int lineIndex = 0;
 
         final StringBuilder page = new StringBuilder();
 
         int totalBytes = 0;
+        int totalChars = 0;
         float lineWidth = 0;
 
         while (chars.hasNext()) {
@@ -297,35 +361,59 @@ public class BookBot extends Module {
             float charWidth = widthRetriever.getWidth(c, Style.EMPTY);
             if (charWidth > this.maxCharWidth.get()) continue;
 
+            if (c < 0x80) {
+                if (excludeOneByte && (totalBytes + 2) <= this.maxBytes.get()) {
+                    continue;
+                }
+            } else if (c < 0x800) {
+                if (excludeTwoByte && (totalBytes + 3) <= this.maxBytes.get()) {
+                    continue;
+                }
+            }
+
             int charBytes = new String(Character.toChars(c)).getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
 
             if (c == '\r' || c == '\n') {
-                page.append('\n');
+                if (lineIndex < (this.lines.get() - 1)) {
+                    page.append('\n');
+                    totalBytes += 1;
+                    totalChars += 1;
+                }
                 lineIndex++;
-                totalBytes += 1;
                 lineWidth = 0;
             } else {
-                if ((totalBytes + charBytes) > this.bytes.get()) {
+                if ((totalBytes + charBytes) > this.maxBytes.get()) {
                     if (fillPages) {
                         continue; // Try again for a smaller character
                     }
+                    MeteorClient.LOG.warn("Ran out of bytes, setting line to end");
                     lineIndex = this.lines.get(); // Otherwise, signal that this page is done
                 } else {
                     if (lineWidth + charWidth > 114f) { // Reached end of line
-                        page.append('\n');
                         lineIndex++;
-                        totalBytes += 1;
                         lineWidth = 0;
-                        // Wrap to next line, unless wrapping to next page
                         if (lineIndex != this.lines.get()) {
-                            totalBytes += charBytes;
-                            lineWidth += charWidth;
-                            page.appendCodePoint(c);
+//                            page.append('\n');
+//                            totalBytes += 1;
+//                            if ((totalBytes + charBytes) > this.bytes.get()) {
+//                                if (fillPages && totalBytes < this.bytes.get()) {
+//                                    continue; // Try again for a smaller character
+//                                }
+//                                MeteorClient.LOG.warn("Ran out of bytes after a newline, setting line to end");
+//                                lineIndex = this.lines.get(); // Otherwise, signal that this page is done
+//                            } else {
+                                // Wrap to next line, unless wrapping to next page
+                                totalBytes += charBytes;
+                                totalChars += 1;
+                                lineWidth += charWidth;
+                                page.appendCodePoint(c);
+//                            }
                         }
                     } else if (lineWidth == 0f && c == ' ') {
                         continue; // Prevent leading space from text wrapping
                     } else {
                         totalBytes += charBytes;
+                        totalChars += 1;
                         lineWidth += charWidth;
                         page.appendCodePoint(c);
                     }
@@ -333,13 +421,21 @@ public class BookBot extends Module {
             }
 
             // Reached end of page
-            if (lineIndex == this.lines.get() || totalBytes >= this.bytes.get()) {
-                MeteorClient.LOG.warn("Wrote " + totalBytes + " bytes in page " + pageIndex);
+            if (lineIndex == this.lines.get() || totalBytes >= this.maxBytes.get() || totalChars >= this.maxChars.get()) {
+                if (lineIndex == this.lines.get()) {
+                    MeteorClient.LOG.warn("Ran out of lines");
+                } else if (totalBytes >= this.maxBytes.get()) {
+                    MeteorClient.LOG.warn("Ran out of bytes");
+                } else if (totalChars >= this.maxChars.get()) {
+                    MeteorClient.LOG.warn("Ran out of characters");
+                }
+                MeteorClient.LOG.warn("Wrote " + totalBytes + " bytes in " + totalChars + " characters in page " + pageIndex);
                 pages.add(page.toString());
                 page.setLength(0);
                 pageIndex++;
                 lineIndex = 0;
                 totalBytes = 0;
+                totalChars = 0;
                 lineWidth = 0;
 
                 // No more pages
@@ -348,6 +444,7 @@ public class BookBot extends Module {
                 // Wrap to next page
                 if (c != '\r' && c != '\n') {
                     totalBytes += charBytes;
+                    totalChars += 1;
                     lineWidth += charWidth;
                     page.appendCodePoint(c);
                 }
@@ -361,111 +458,11 @@ public class BookBot extends Module {
 
         // Get the title with count
         String title = name.get();
-        if (count.get() && bookCount != 0) title += " #" + bookCount;
+        if (count.get()) title += bookCount;
 
         // Write data to book
         mc.player.getMainHandStack().setSubNbt("title", NbtString.of(title));
-        mc.player.getMainHandStack().setSubNbt("author", NbtString.of(mc.player.getGameProfile().getName()));
-
-        // Write pages NBT
-        NbtList pageNbt = new NbtList();
-        pages.stream().map(NbtString::of).forEach(pageNbt::add);
-        if (!pages.isEmpty()) mc.player.getMainHandStack().setSubNbt("pages", pageNbt);
-
-        // Send book update to server
-        mc.player.networkHandler.sendPacket(new BookUpdateC2SPacket(mc.player.getInventory().selectedSlot, pages, sign.get() ? Optional.of(title) : Optional.empty()));
-
-        bookCount++;
-    }
-
-    private void writeRandomBook() {
-        PrimitiveIterator.OfInt threebytechars = random.ints(0x0800, 0x10000)
-            .filter(i -> !Character.isWhitespace(i))
-            .iterator();
-
-        PrimitiveIterator.OfInt onebytechars = random.ints(0x21, 0x7E)
-            .filter(i -> !Character.isWhitespace(i) && i != '\r' && i != '\n')
-            .iterator();
-
-        ArrayList<String> pages = new ArrayList<>();
-
-        for (int pageI = 0; pageI < (mode.get() == Mode.File ? 100 : this.pages.get()); pageI++) {
-            StringBuilder page = new StringBuilder();
-
-            int totalBytes = 0;
-            for (int lineI = 0; lineI < this.lines.get(); lineI++) {
-                if (totalBytes >= this.bytes.get()) break;
-
-                double lineWidth = 0;
-                StringBuilder line = new StringBuilder();
-
-                while (totalBytes + 3 <= this.bytes.get()) {
-                    // Get the next character
-                    int nextChar = threebytechars.nextInt();
-
-                    // Ignore newline chars when writing lines, should already be organised
-                    if (nextChar == '\r' || nextChar == '\n') break;
-
-                    // Make sure the character will fit on the line
-                    double charWidth = ((TextHandlerAccessor) mc.textRenderer.getTextHandler()).getWidthRetriever().getWidth(nextChar, Style.EMPTY);
-                    if (charWidth > this.maxCharWidth.get()) continue;
-                    if (lineWidth + charWidth > 114) break;
-
-                    int charBytes = new String(Character.toChars(nextChar)).getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
-                    if ((totalBytes + charBytes) > this.bytes.get()) continue;
-
-                    // Append it to the line
-                    line.appendCodePoint(nextChar);
-                    lineWidth += charWidth;
-                    totalBytes += charBytes;
-                }
-
-                if (totalBytes + 3 > this.bytes.get()) {
-                    if (totalBytes < this.bytes.get()) {
-                        MeteorClient.LOG.warn("Page almost full! Wrote " + totalBytes + " bytes of 3-byte characters");
-                    } else {
-                        MeteorClient.LOG.warn("Page already full! Wrote " + totalBytes + " bytes of 3-byte characters");
-                    }
-                    while(totalBytes < this.bytes.get()) {
-                        if (lineWidth + 2 > 114) {
-                            MeteorClient.LOG.warn("Didn't write extra byte, line too long");
-                            break;
-                        }
-
-                        int nextChar = onebytechars.nextInt();
-
-                        double charWidth = ((TextHandlerAccessor) mc.textRenderer.getTextHandler()).getWidthRetriever().getWidth(nextChar, Style.EMPTY);
-                        if (lineWidth + charWidth > 114) continue;
-
-                        line.appendCodePoint(nextChar);
-                        lineWidth += charWidth;
-                        totalBytes += 1;
-                        MeteorClient.LOG.warn("Wrote extra byte, page is now " + totalBytes + " bytes");
-                    }
-                }
-
-                // Append the line to the page
-                page.append(line);
-                if (totalBytes < this.bytes.get()) {
-                    page.append('\n');
-                    totalBytes += 1;
-                    if (totalBytes == this.bytes.get()) {
-                        MeteorClient.LOG.warn("Wrote final newline, page is now " + totalBytes + " bytes");
-                    }
-                }
-            }
-
-            // Append page to the page list
-            pages.add(page.toString());
-        }
-
-        // Get the title with count
-        String title = name.get();
-        if (count.get() && bookCount != 0) title += " #" + bookCount;
-
-        // Write data to book
-        mc.player.getMainHandStack().setSubNbt("title", NbtString.of(title));
-        mc.player.getMainHandStack().setSubNbt("author", NbtString.of(mc.player.getGameProfile().getName()));
+        mc.player.getMainHandStack().setSubNbt("author", NbtString.of(this.author.get().isEmpty() ? mc.player.getGameProfile().getName() : this.author.get()));
 
         // Write pages NBT
         NbtList pageNbt = new NbtList();
